@@ -36,7 +36,7 @@ main:
   mov ss, ax                        ; stack grows downwards from where we are loaded in memory
   mov sp, 0x7C00                    ; that's why the stack pointer begins at the OS beginning, to avoid overwritting
 
-  ; Following stanislav.org/helppc/int_13-2.html
+  ; Following stanislavs.org/helppc/int_13-2.html
   ; INT 13, 2 - Read Disk Sectors
 	; AH = 02
 	; AL = number of sectors to read	(1-128 dec.)
@@ -46,14 +46,186 @@ main:
 	; DL = drive number (0=A:, 1=2nd floppy, 80h=drive 0, 81h=drive 1)
 	; ES:BX = pointer to buffer
 
-  mov [ebr_drive_number], dl
-  mov ax, 1
-  mov cl, 1                         ; number of sectors to read
-  mov bx, 0x7E00                    ; pointer to buffer
-  call disk_read
+  ; mov [ebr_drive_number], dl
+  ; mov ax, 1
+  ; mov cl, 1                         ; number of sectors to read
+  ; mov bx, 0x7E00                    ; pointer to buffer
+  ; call disk_read
   
   mov si, msg_hello_world
   call printString
+
+  ; 4 segments
+  ; reserved segment: 1 sector
+  ; FileAllocationTables sectors: 9 sectors per FAT * 2 FATs
+  ; Root directory:
+  ; Data
+
+  ; -----------------------------------------------------------
+  ; Calculate the Logical Block Address (LBA) of the Root Directory
+  ; -----------------------------------------------------------
+
+  ; Load the number of sectors per FAT from the BIOS Parameter Block (BPB) into AX
+  mov ax, [bdb_sectors_per_fat]  
+
+  ; Load the number of FAT tables into BL (BL = FAT count)
+  mov bl, [bdb_fat_count]       
+
+  ; Clear BH to make BX a valid 16-bit register (BX = FAT count)
+  xor bh, bh                  
+
+  ; Multiply AX by BX (AX = sectors per FAT * FAT count)
+  mul bx                     
+
+  ; Add the number of reserved sectors (from BPB) to AX
+  ; This gives the starting LBA of the first FAT.
+  add ax, [bdb_reserved_sectors] 
+
+  ; Push this LBA onto the stack for later use
+  push ax                     
+
+  ; -----------------------------------------------------------
+  ; Calculate the Number of Sectors for the Root Directory
+  ; -----------------------------------------------------------
+
+  ; Load the number of root directory entries from BPB into AX
+  mov ax, [bdb_dir_entries_count] 
+
+  ; Multiply AX by 32 (each directory entry is 32 bytes)
+  ; This gives the total size of the root directory in bytes.
+  shl ax, 5                    
+
+  ; Clear DX, preparing for the division
+  xor dx, dx                 
+
+  ; Divide AX by the number of bytes per sector (from BPB)
+  ; This gives the number of sectors needed to store the root directory.
+  div word [bdb_bytes_per_sector]
+
+  ; -----------------------------------------------------------
+  ; Check for Partial Sector and Adjust Sector Count if Needed
+  ; -----------------------------------------------------------
+
+  ; Test DX to see if there is a remainder (partial sector)
+  test dx, dx                 
+
+  ; If no remainder (DX == 0), jump to rootDirAfter
+  jz rootDirAfter             
+
+  ; If there was a remainder, increment AX to account for an additional sector
+  inc ax                      
+
+  ; -----------------------------------------------------------
+  ; Prepare for Disk Read Operation
+  ; -----------------------------------------------------------
+
+rootDirAfter:
+  ; Move the number of sectors to read (from AX) into CL
+  mov cl, al                   
+
+  ; Pop the LBA of the root directory start sector from the stack into AX
+  pop ax                      
+
+  ; Load the drive number into DL (from the Extended BIOS Data Area or passed from bootloader)
+  mov dl, [ebr_drive_number]  
+
+  ; Load the address of the buffer into BX (where data will be read into)
+  mov bx, buffer              
+
+  ; Call the disk_read subroutine to read the calculated number of sectors
+  call disk_read              
+
+  ; -----------------------------------------------------------
+  ; Prepare to Process the Root Directory Entries
+  ; -----------------------------------------------------------
+
+  ; Clear BX, likely preparing it to iterate over directory entries or similar
+  xor bx, bx                 
+
+  ; Load the buffer address into DI, setting up for processing the directory entries
+  mov di, buffer              
+
+searchKernel:
+  mov si, file_kernel_bin
+  mov cx, 11                        ; size of file_kernel_bin
+  push di                           ; preserving the buffer
+  repe cmpsb                        ; repeat comparison of bytes between 'si' and 'di' eleven times
+  pop di
+  je foundKernel
+
+  add di, 32                        ; next directory entry
+  inc bx
+  cmp bx, [bdb_dir_entries_count]   ; have we reached all the directories that exist?
+  jl searchKernel
+
+  jmp kernelNotFound
+
+kernelNotFound:
+  mov si, msg_kernel_not_found
+  call printString
+
+  hlt
+  jmp halt
+
+foundKernel:
+  mov ax, [di + 26]                 ; 'di' holds the kernel address, 26 is the offset needed to find the first logical cluster field
+  mov [kernel_cluster], ax
+
+  mov ax, [bdb_reserved_sectors]
+  mov bx, buffer
+  mov cl, [bdb_sectors_per_fat]
+  mov dl, [ebr_drive_number]
+
+  call disk_read
+
+  mov bx, kernel_load_segment
+  mov es, bx
+  mov bx, kernel_load_offset
+
+loadKernelLoop:
+  mov ax, [kernel_cluster]
+  add ax, 31                        ; Offset to read the cluster
+  mov cl, 1
+  mov dl, [ebr_drive_number]
+
+  call disk_read
+
+  add bx, [bdb_bytes_per_sector]
+
+  mov ax, [kernel_cluster]          ; (kernel cluster * 3) / 2
+  mov cx, 3
+  mul cx
+  mov cx, 2
+  div cx
+
+  mov si, buffer
+  add si, ax
+  mov ax, [ds:si]
+
+  or dx, dx
+  jz even
+
+odd:
+  shr ax, 4
+  jmp nextClusterAfter
+
+even:
+  and ax, 0x0FFF
+
+nextClusterAfter:
+  cmp ax, 0x0FF8
+  JAE readFinish
+
+  mov [kernel_cluster], ax
+  jmp loadKernelLoop
+
+readFinish:
+  mov dl, [ebr_drive_number]
+  mov ax, [kernel_load_segment]
+  mov ds, ax
+  mov es, ax
+
+  jmp kernel_load_segment:kernel_load_offset
 
   hlt
 
@@ -155,6 +327,14 @@ done_read:
 
 msg_read_failed: db 'Read from disk failed', 0x0D, 0x0A, 0
 msg_hello_world: db 'Welcome to your Nightmare', 0x0D, 0x0A, 0
+file_kernel_bin db 'KERNEL  BIN'
+msg_kernel_not_found db 'KERNEL.BIN not found!'
+kernel_cluster dw 0
+
+kernel_load_segment equ 0x2000
+kernel_load_offset equ 0
 
 times 510-($-$$) db 0 ; Fill the rest of the boot sector with zeroes
 dw 0xaa55 ; Boot sector signature 
+
+buffer:
